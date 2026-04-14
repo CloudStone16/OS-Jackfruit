@@ -384,9 +384,20 @@ int child_fn(void *arg)
     mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
     // Change root filesystem
-    chdir(cfg->rootfs);
-    chroot(".");
-    chdir("/");
+    if (chdir(cfg->rootfs) < 0) {
+    perror("chdir failed");
+    exit(1);
+    }
+
+    if (chroot(".") < 0) {
+        perror("chroot failed");
+        exit(1);
+    }
+
+    if (chdir("/") < 0) {
+        perror("chdir / failed");
+        exit(1);
+    }
 
     // Mount /proc inside container
     mkdir("/proc", 0555);
@@ -400,7 +411,9 @@ int child_fn(void *arg)
     // Execute command
     printf("[Container %s] Starting...\n", cfg->id);
     fflush(stdout);
-    execlp(cfg->command, cfg->command, "-i", NULL);
+    printf("[Container %s] Starting...\n", cfg->id);
+    fflush(stdout);
+    execlp("/bin/sh", "sh", "-c", "while true; do sleep 10; done", NULL);
 
     // If exec fails
     perror("exec failed");
@@ -485,6 +498,9 @@ static int start_container(supervisor_ctx_t *ctx, const control_request_t *req)
 
     int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
 
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "cp -r rootfs-base %s", req->rootfs);
+    system(cmd);
     pid_t pid = clone(child_fn, stack_top, flags, cfg);
     if (pid < 0) {
         perror("clone");
