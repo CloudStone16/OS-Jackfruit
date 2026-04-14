@@ -34,6 +34,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/resource.h>
+#include <sys/select.h>
 
 #include "monitor_ioctl.h"
 
@@ -41,7 +43,7 @@
 #define CONTAINER_ID_LEN 32
 #define CONTROL_PATH "/tmp/mini_runtime.sock"
 #define LOG_DIR "logs"
-#define CONTROL_MESSAGE_LEN 256
+#define CONTROL_MESSAGE_LEN 2048
 #define CHILD_COMMAND_LEN 256
 #define LOG_CHUNK_SIZE 4096
 #define LOG_BUFFER_CAPACITY 16
@@ -116,7 +118,7 @@ typedef struct {
     char command[CHILD_COMMAND_LEN];
     int nice_value;
     int log_write_fd;
-} child_config_t;
+} child_config_t; 
 
 typedef struct {
     int server_fd;
@@ -338,7 +340,39 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *cfg = (child_config_t *)arg;
+    
+    // Redirect stdout and stderr to pipe
+    dup2(cfg->log_write_fd, STDOUT_FILENO);
+    dup2(cfg->log_write_fd, STDERR_FILENO);
+    close(cfg->log_write_fd);
+
+    // Set hostname
+    sethostname(cfg->id, strlen(cfg->id));
+
+    // Make mount private (important for container isolation)
+    mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+
+    // Change root filesystem
+    chdir(cfg->rootfs);
+    chroot(".");
+    chdir("/");
+
+    // Mount /proc inside container
+    mkdir("/proc", 0555);
+    mount("proc", "/proc", "proc", 0, NULL);
+
+    // Set nice value (optional scheduling)
+    if (cfg->nice_value != 0) {
+        setpriority(PRIO_PROCESS, 0, cfg->nice_value);
+    }
+
+    // Execute command
+    execlp(cfg->command, cfg->command, NULL);
+
+    // If exec fails
+    perror("exec failed");
+    _exit(1);
     return 1;
 }
 
