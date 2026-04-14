@@ -630,7 +630,25 @@ int main(int argc, char *argv[])
             // remove newline character
             input[strcspn(input, "\n")] = '\0';
 
-            printf("[DEBUG] Command received: %s\n", input);
+            // Tokenize input into arguments
+            char *args[10];
+            int arg_count = 0;
+
+            char *token = strtok(input, " ");
+            while (token != NULL && arg_count < 10) {
+                args[arg_count++] = token
+                token = strtok(NULL, " ");
+            }
+
+            if (arg_count == 0) continue;
+
+            // Handle "start" command
+            if (strcmp(args[0], "start") == 0) {
+                // Call existing cmd_start function
+                cmd_start(arg_count, args);
+            } else {
+                printf("[ERROR] Unknown command: %s\n", args[0]);
+            }
         }
 
         return 0;
