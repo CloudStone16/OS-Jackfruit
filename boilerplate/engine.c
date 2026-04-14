@@ -398,7 +398,9 @@ int child_fn(void *arg)
     }
 
     // Execute command
-    execlp(cfg->command, cfg->command, NULL);
+    printf("[Container %s] Starting...\n", cfg->id);
+    fflush(stdout);
+    execlp(cfg->command, cfg->command, "-i", NULL);
 
     // If exec fails
     perror("exec failed");
