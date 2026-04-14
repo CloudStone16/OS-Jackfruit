@@ -130,6 +130,8 @@ typedef struct {
     container_record_t *containers;
 } supervisor_ctx_t;
 
+static supervisor_ctx_t *g_ctx = NULL;
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -449,6 +451,69 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
  *   - accept control requests and update container state
  *   - reap children and respond to signals
  */
+
+static int start_container(supervisor_ctx_t *ctx, const control_request_t *req)
+{
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        perror("pipe");
+        return -1;
+    }
+
+    child_config_t *cfg = malloc(sizeof(child_config_t));
+    if (!cfg) {
+        perror("malloc");
+        return -1;
+    }
+
+    memset(cfg, 0, sizeof(*cfg));
+    strncpy(cfg->id, req->container_id, sizeof(cfg->id) - 1);
+    strncpy(cfg->rootfs, req->rootfs, sizeof(cfg->rootfs) - 1);
+    strncpy(cfg->command, req->command, sizeof(cfg->command) - 1);
+    cfg->nice_value = req->nice_value;
+    cfg->log_write_fd = pipefd[1];
+
+    char *stack = malloc(STACK_SIZE);
+    if (!stack) {
+        perror("malloc");
+        return -1;
+    }
+
+    char *stack_top = stack + STACK_SIZE;
+
+    int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
+
+    pid_t pid = clone(child_fn, stack_top, flags, cfg);
+    if (pid < 0) {
+        perror("clone");
+        return -1;
+    }
+
+    close(pipefd[1]); // parent doesn't write
+
+    // 🔹 Add metadata
+    container_record_t *rec = malloc(sizeof(container_record_t));
+    memset(rec, 0, sizeof(*rec));
+
+    strncpy(rec->id, req->container_id, sizeof(rec->id) - 1);
+    rec->host_pid = pid;
+    rec->started_at = time(NULL);
+    rec->state = CONTAINER_RUNNING;
+    rec->soft_limit_bytes = req->soft_limit_bytes;
+    rec->hard_limit_bytes = req->hard_limit_bytes;
+
+    snprintf(rec->log_path, sizeof(rec->log_path), "%s/%s.log", LOG_DIR, rec->id);
+
+    pthread_mutex_lock(&ctx->metadata_lock);
+    rec->next = ctx->containers;
+    ctx->containers = rec;
+    pthread_mutex_unlock(&ctx->metadata_lock);
+
+    printf("[+] Started container %s (PID %d)\n", rec->id, pid);
+
+    return 0;
+}
+
 static int run_supervisor(const char *rootfs)
 {
     supervisor_ctx_t ctx;
@@ -481,13 +546,89 @@ static int run_supervisor(const char *rootfs)
      *   4) spawn the logger thread
      *   5) enter the supervisor event loop
      */
-    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
 
-    bounded_buffer_begin_shutdown(&ctx.log_buffer);
-    bounded_buffer_destroy(&ctx.log_buffer);
-    pthread_mutex_destroy(&ctx.metadata_lock);
-    return 1;
-}
+    g_ctx = &ctx;
+
+    // create log dir
+    mkdir(LOG_DIR, 0755);
+
+    // create UNIX socket
+    ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ctx.server_fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    unlink(CONTROL_PATH);
+
+    if (bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+
+    if (listen(ctx.server_fd, 5) < 0) {
+        perror("listen");
+        return 1;
+    }
+
+    printf("[+] Supervisor listening on %s\n", CONTROL_PATH);
+
+    // MAIN LOOP
+    while (!ctx.should_stop) {
+        int client_fd = accept(ctx.server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            perror("accept");
+            continue;
+        }
+
+        control_request_t req;
+        memset(&req, 0, sizeof(req));
+
+        if (read(client_fd, &req, sizeof(req)) <= 0) {
+            close(client_fd);
+            continue;
+        }
+
+        control_response_t resp;
+        memset(&resp, 0, sizeof(resp));
+
+        if (req.kind == CMD_START) {
+            if (start_container(&ctx, &req) == 0) {
+                resp.status = 0;
+                snprintf(resp.message, sizeof(resp.message),
+                        "Container %s started", req.container_id);
+            } else {
+                resp.status = 1;
+                snprintf(resp.message, sizeof(resp.message),
+                        "Failed to start container");
+            }
+        } else {
+            resp.status = 1;
+            snprintf(resp.message, sizeof(resp.message),
+                    "Unsupported command");
+        }
+
+        write(client_fd, &resp, sizeof(resp));
+        close(client_fd);
+
+        // 🔹 REAP ZOMBIES
+        int status;
+        while (waitpid(-1, &status, WNOHANG) > 0) {
+            printf("[+] Reaped container\n");
+        }
+    }
+        fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
+
+        bounded_buffer_begin_shutdown(&ctx.log_buffer);
+        bounded_buffer_destroy(&ctx.log_buffer);
+        pthread_mutex_destroy(&ctx.metadata_lock);
+        return 1;
+    }
 
 /*
  * TODO:
@@ -641,43 +782,11 @@ int main(int argc, char *argv[])
     }
 
     if (strcmp(argv[1], "supervisor") == 0) {
-         printf("[+] Supervisor started with rootfs: %s\n", argv[2]);
-
-        while (1) {
-            printf("engine> ");
-            fflush(stdout);
-
-            char input[256];
-
-            if (fgets(input, sizeof(input), stdin) == NULL) {
-                break;
-            }
-
-            // remove newline character
-            input[strcspn(input, "\n")] = '\0';
-
-            // Tokenize input into arguments
-            char *args[10];
-            int arg_count = 0;
-
-            char *token = strtok(input, " ");
-            while (token != NULL && arg_count < 10) {
-                args[arg_count++] = token
-                token = strtok(NULL, " ");
-            }
-
-            if (arg_count == 0) continue;
-
-            // Handle "start" command
-            if (strcmp(args[0], "start") == 0) {
-                // Call existing cmd_start function
-                cmd_start(arg_count, args);
-            } else {
-                printf("[ERROR] Unknown command: %s\n", args[0]);
-            }
+        if (argc < 3) {
+            fprintf(stderr, "Missing base rootfs\n");
+            return 1;
         }
-
-        return 0;
+        return run_supervisor(argv[2]);
     }
 
     if (strcmp(argv[1], "start") == 0)
